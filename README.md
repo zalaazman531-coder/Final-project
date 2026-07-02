@@ -8,8 +8,7 @@ can we predict it for countries the model has never seen?
 - **Classification task** — predict its Low / Medium / High life-expectancy band
   (tertiles of the target, derived independently of the input features).
 
-**🔗 Live app:** _add your Streamlit Cloud URL here after deploying_
-(share.streamlit.io → Create app → this repo, branch `main`, file `app/app.py`)
+**🔗 Live app:** https://final-project-5lurfzrvcygvyhd64jq6wn.streamlit.app/
 
 ## Results at a glance (held-out test set, unseen countries)
 
