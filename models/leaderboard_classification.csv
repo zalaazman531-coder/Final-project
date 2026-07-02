@@ -1,0 +1,5 @@
+model,Accuracy,F1_weighted,ROC_AUC_ovr
+Dummy (most frequent),0.338,0.171,0.5
+Logistic Regression,0.729,0.733,0.896
+Decision Tree,0.729,0.733,0.862
+XGBoost (tuned),0.774,0.777,0.915

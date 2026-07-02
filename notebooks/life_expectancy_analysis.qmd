@@ -1,0 +1,631 @@
+---
+title: "Life Expectancy (WHO) — End-to-End Analysis"
+subtitle: "EDA, cleaning, feature engineering, and a model ladder for regression & classification"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+jupyter: python3
+---
+
+```{python}
+#| label: setup
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import (
+    StratifiedGroupKFold, GridSearchCV, validation_curve
+)
+from sklearn.linear_model import LinearRegression, LogisticRegression, LassoCV
+from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
+from sklearn.dummy import DummyRegressor, DummyClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    mean_absolute_error, mean_squared_error, r2_score,
+    accuracy_score, f1_score, roc_auc_score, confusion_matrix, ConfusionMatrixDisplay
+)
+from xgboost import XGBRegressor, XGBClassifier
+
+sns.set_theme(style="whitegrid")
+plt.rcParams["figure.dpi"] = 100
+RANDOM_STATE = 42
+```
+
+## 1. Load & Inspect the Data
+
+```{python}
+#| label: load-data
+df = pd.read_csv("../data/Life Expectancy Data.csv")
+
+# The raw column names have inconsistent leading/trailing whitespace — normalize them.
+df.columns = df.columns.str.strip()
+df.columns = df.columns.str.replace(r"\s+", "_", regex=True)
+
+print(f"Shape: {df.shape[0]} rows x {df.shape[1]} columns")
+df.head()
+```
+
+```{python}
+#| label: dtypes
+df.dtypes
+```
+
+```{python}
+#| label: nulls
+null_summary = pd.DataFrame({
+    "n_missing": df.isna().sum(),
+    "pct_missing": (df.isna().mean() * 100).round(2)
+}).sort_values("pct_missing", ascending=False)
+null_summary[null_summary.n_missing > 0]
+```
+
+```{python}
+#| label: basic-stats
+df.describe().T
+```
+
+```{python}
+#| label: categoricals
+print("Status categories:", df.Status.unique())
+print("Number of countries:", df.Country.nunique())
+print("Year range:", df.Year.min(), "-", df.Year.max())
+```
+
+Key observations:
+
+- 2938 rows spanning 193 countries, years 2000–2015.
+- `Life_expectancy` is our **regression target**. Our **classification target** is `life_expectancy_band` — a Low / Medium / High tertile banding of `Life_expectancy`, derived later in the cleaning step. We deliberately do *not* use `Status` (Developed/Developing) as the classification target: it's assigned largely on economic criteria, so it's near-definitionally correlated with income/schooling features and would make the classification ladder circular rather than a genuine predictive exercise. `Status` remains available as an input *feature* for both tasks.
+- Several health/economic indicators (`Hepatitis_B`, `GDP`, `Population`, `Alcohol`, `Total_expenditure`) have meaningful missingness, concentrated in a subset of countries — this points to *missing not at random* rather than random noise.
+
+## 2. Exploratory Data Analysis
+
+### 2.1 Target distribution
+
+```{python}
+#| label: target-dist
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+sns.histplot(df.Life_expectancy.dropna(), kde=True, ax=axes[0])
+axes[0].set_title("Distribution of Life Expectancy")
+sns.boxplot(x="Status", y="Life_expectancy", data=df, ax=axes[1])
+axes[1].set_title("Life Expectancy by Development Status")
+plt.tight_layout()
+plt.show()
+```
+
+Life expectancy is left-skewed with a long lower tail (countries in crisis / conflict), and developed countries sit substantially higher and tighter than developing ones. The tertile bands we use for classification (Section 3.3) will follow this same skew — "Low" covers a wider absolute range than "High".
+
+### 2.2 Correlation heatmap
+
+```{python}
+#| label: corr-heatmap
+#| fig-width: 9
+#| fig-height: 8
+numeric_df = df.select_dtypes(include=np.number).drop(columns=["Year"])
+corr = numeric_df.corr()
+
+plt.figure(figsize=(10, 8))
+sns.heatmap(corr, cmap="RdBu_r", center=0, annot=False, linewidths=0.5)
+plt.title("Correlation Heatmap — Numeric Features")
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: corr-with-target
+corr.Life_expectancy.drop("Life_expectancy").sort_values(key=abs, ascending=False)
+```
+
+`Income_composition_of_resources`, `Schooling`, and `Adult_Mortality` show the strongest linear relationships with life expectancy; `HIV/AIDS` is strongly *negatively* associated. This heatmap is purely exploratory (computed on the full dataset before any train/test split) — it informs our intuition but is not itself used to pick features; the leakage-safe feature selection in Section 6 uses the training fold only.
+
+### 2.3 Feature-target relationships
+
+```{python}
+#| label: feature-target-plots
+#| fig-width: 11
+#| fig-height: 7
+fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+pairs = ["Schooling", "Income_composition_of_resources", "Adult_Mortality",
+         "HIV/AIDS", "GDP", "BMI"]
+for ax, col in zip(axes.flat, pairs):
+    sns.scatterplot(x=col, y="Life_expectancy", data=df, hue="Status",
+                     alpha=0.4, s=18, ax=ax, legend=(col == "Schooling"))
+    ax.set_title(f"Life Expectancy vs {col}")
+plt.tight_layout()
+plt.show()
+```
+
+`GDP` and `HIV/AIDS` show a strongly non-linear (log-like) relationship with life expectancy, which motivates a log transform during feature engineering.
+
+## 3. Clean
+
+```{python}
+#| label: clean-missing
+clean = df.copy()
+
+# Impute numeric columns using each country's own median first (countries are
+# fairly stable year-to-year), then fall back to the global median for
+# countries missing a column entirely.
+numeric_cols = clean.select_dtypes(include=np.number).columns.drop("Year")
+for col in numeric_cols:
+    clean[col] = clean.groupby("Country")[col].transform(lambda s: s.fillna(s.median()))
+    clean[col] = clean[col].fillna(clean[col].median())
+
+print("Remaining missing values:", clean.isna().sum().sum())
+```
+
+```{python}
+#| label: clean-outliers
+#| fig-width: 10
+#| fig-height: 3
+skewed_cols = ["GDP", "Population", "percentage_expenditure", "Measles"]
+fig, axes = plt.subplots(1, len(skewed_cols), figsize=(14, 3))
+for ax, col in zip(axes, skewed_cols):
+    sns.boxplot(y=clean[col], ax=ax)
+    ax.set_title(col)
+plt.tight_layout()
+plt.show()
+
+# These columns are extremely right-skewed with genuine (not erroneous) extreme
+# values — e.g. the US's GDP or population dwarfs small nations. Rather than
+# drop these real observations, cap at the 1st/99th percentile (winsorize) so
+# a handful of outlier countries don't dominate linear models, and log-transform
+# in the feature engineering step below.
+for col in skewed_cols:
+    lo, hi = clean[col].quantile([0.01, 0.99])
+    clean[col] = clean[col].clip(lo, hi)
+```
+
+```{python}
+#| label: clean-encode
+# Status is binary — encode directly (1 = Developed, 0 = Developing). It is
+# kept only as an input *feature* from here on, never as a prediction target.
+clean["Status_binary"] = (clean.Status == "Developed").astype(int)
+
+# Country has 193 levels — too high-cardinality for one-hot encoding without
+# overfitting risk, and we deliberately do NOT target-encode it, since that
+# would leak the target through the country-level mean. We keep Country only
+# as a grouping key for the split, not as a model feature.
+clean.head()
+```
+
+### 3.1 Deriving the classification target
+
+```{python}
+#| label: derive-classification-target
+# Bin Life_expectancy into tertiles: roughly equal-sized Low / Medium / High
+# groups. This is derived purely from the target column itself (no feature
+# leaks into it), so it stays a legitimate, independent classification
+# target rather than reusing an input feature like Status.
+clean["life_expectancy_band"] = pd.qcut(
+    clean.Life_expectancy, q=3, labels=["Low", "Medium", "High"]
+)
+
+band_edges = pd.qcut(clean.Life_expectancy, q=3).cat.categories
+print("Tertile cut points:", [(round(iv.left, 1), round(iv.right, 1)) for iv in band_edges])
+
+fig, ax = plt.subplots(figsize=(5, 3.5))
+clean.life_expectancy_band.value_counts().loc[["Low", "Medium", "High"]].plot(
+    kind="bar", ax=ax, color=["#c44e52", "#dd8452", "#4c72b0"]
+)
+ax.set_title("Classification Target — Life Expectancy Band")
+ax.set_ylabel("Count")
+plt.tight_layout()
+plt.show()
+```
+
+## 4. Engineer Features
+
+```{python}
+#| label: feature-engineering
+feat = clean.copy()
+
+# Log-transform heavily skewed economic indicators (see EDA above).
+feat["log_GDP"] = np.log1p(feat.GDP)
+feat["log_Population"] = np.log1p(feat.Population)
+feat["log_percentage_expenditure"] = np.log1p(feat.percentage_expenditure)
+
+# Domain-logic composite: average immunization coverage across the three
+# vaccine-preventable-disease indicators, rather than treating them as three
+# separate near-duplicate signals.
+feat["avg_immunization"] = feat[["Hepatitis_B", "Polio", "Diphtheria"]].mean(axis=1)
+
+# Domain-logic composite: average child thinness across the two age bands.
+feat["avg_thinness"] = feat[["thinness_1-19_years", "thinness_5-9_years"]].mean(axis=1)
+
+# Ratio: child mortality burden relative to adult mortality burden.
+feat["child_to_adult_mortality_ratio"] = (
+    (feat.infant_deaths + feat["under-five_deaths"] + 1) / (feat.Adult_Mortality + 1)
+)
+
+# Interaction: education and income jointly proxy for overall development —
+# their product captures compounding effects neither captures alone.
+feat["schooling_x_income"] = feat.Schooling * feat.Income_composition_of_resources
+
+# Bin: development era, since health infrastructure shifted globally over the
+# 2000-2015 window (e.g. post-2008 financial crisis, MDG-era health investment).
+feat["era"] = pd.cut(feat.Year, bins=[1999, 2004, 2009, 2015],
+                      labels=["2000-2004", "2005-2009", "2010-2015"])
+feat = pd.get_dummies(feat, columns=["era"], drop_first=True)
+feat = feat.reset_index(drop=True)
+
+feat.filter(like="log_").join(feat[["avg_immunization", "avg_thinness",
+                                     "child_to_adult_mortality_ratio",
+                                     "schooling_x_income"]]).describe().T
+```
+
+## 5. Split the Data
+
+Rows are repeated measurements per country (2000–2015). Splitting randomly would let the *same country's* neighboring years leak across train/test, letting a model "memorize" a country rather than generalize — so we split **by country** (group split). We additionally **stratify on the classification target** (`life_expectancy_band`) using `StratifiedGroupKFold`, so every partition keeps a similar Low/Medium/High mix despite the grouping constraint. Both tasks reuse this same train/val/test partition of rows, so results are directly comparable.
+
+```{python}
+#| label: split-data
+candidate_features = [
+    "Adult_Mortality", "infant_deaths", "Alcohol", "log_percentage_expenditure",
+    "Hepatitis_B", "Measles", "BMI", "under-five_deaths", "Polio",
+    "Total_expenditure", "Diphtheria", "HIV/AIDS", "log_GDP", "log_Population",
+    "avg_thinness", "Income_composition_of_resources", "Schooling",
+    "avg_immunization", "child_to_adult_mortality_ratio", "schooling_x_income",
+    "Status_binary", "era_2005-2009", "era_2010-2015",
+]
+
+X_all = feat[candidate_features].reset_index(drop=True)
+y_reg = feat["Life_expectancy"].reset_index(drop=True)
+# XGBoost needs integer class labels, so encode the ordered bands as
+# 0=Low, 1=Medium, 2=High and keep the names around for display.
+BAND_LABELS = ["Low", "Medium", "High"]
+y_clf = feat["life_expectancy_band"].cat.codes.reset_index(drop=True)
+groups = feat["Country"].reset_index(drop=True)
+
+# Stage 1: carve off ~20% test set, grouped by country and stratified by band.
+sgkf_outer = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+trainval_idx, test_idx = next(sgkf_outer.split(X_all, y_clf, groups))
+
+# Stage 2: split the remaining ~80% into train (~60% overall) / val (~20% overall).
+sgkf_inner = StratifiedGroupKFold(n_splits=4, shuffle=True, random_state=RANDOM_STATE)
+train_rel_idx, val_rel_idx = next(sgkf_inner.split(
+    X_all.iloc[trainval_idx], y_clf.iloc[trainval_idx], groups.iloc[trainval_idx]
+))
+train_idx = trainval_idx[train_rel_idx]
+val_idx = trainval_idx[val_rel_idx]
+
+X_train, X_val, X_test = X_all.iloc[train_idx], X_all.iloc[val_idx], X_all.iloc[test_idx]
+y_reg_train, y_reg_val, y_reg_test = y_reg.iloc[train_idx], y_reg.iloc[val_idx], y_reg.iloc[test_idx]
+y_clf_train, y_clf_val, y_clf_test = y_clf.iloc[train_idx], y_clf.iloc[val_idx], y_clf.iloc[test_idx]
+
+# Sanity checks: no country appears in more than one split; classes are balanced.
+overlap_train_test = set(groups.iloc[train_idx]) & set(groups.iloc[test_idx])
+overlap_train_val = set(groups.iloc[train_idx]) & set(groups.iloc[val_idx])
+print(f"Train: {len(X_train)}  Val: {len(X_val)}  Test: {len(X_test)}")
+print(f"Country overlap train/test: {len(overlap_train_test)}, train/val: {len(overlap_train_val)}")
+band_names = dict(enumerate(BAND_LABELS))
+print("\nBand balance (%) — train:")
+print((y_clf_train.value_counts(normalize=True) * 100).round(1).rename(index=band_names))
+print("\nBand balance (%) — test:")
+print((y_clf_test.value_counts(normalize=True) * 100).round(1).rename(index=band_names))
+```
+
+## 6. Feature Selection (train fold only)
+
+We use two complementary, **leakage-safe** methods — both fit on the training fold only, never on validation/test:
+
+1. **Correlation filter**: among pairs of candidate features correlated above 0.85 *within the training data*, drop the one less correlated with the training target. This removes redundant, multicollinear signals (e.g. features that duplicate each other) while staying fully interpretable.
+2. **Lasso-based selection**: fit `LassoCV` (5-fold CV, scaled) on the surviving training features to shrink weak predictors' coefficients to exactly zero, keeping only features Lasso considers informative.
+
+```{python}
+#| label: feature-selection-correlation
+train_corr = X_train.join(y_reg_train).corr()
+target_corr = train_corr["Life_expectancy"].drop("Life_expectancy")
+
+to_drop = set()
+for i, f1 in enumerate(candidate_features):
+    for f2 in candidate_features[i + 1:]:
+        if abs(train_corr.loc[f1, f2]) > 0.85:
+            weaker = f1 if abs(target_corr[f1]) < abs(target_corr[f2]) else f2
+            to_drop.add(weaker)
+
+corr_selected = [f for f in candidate_features if f not in to_drop]
+print("Dropped for redundancy (train-fold correlation):", sorted(to_drop))
+print(f"Remaining after correlation filter: {len(corr_selected)}")
+```
+
+```{python}
+#| label: feature-selection-lasso
+lasso_scaler = StandardScaler().fit(X_train[corr_selected])
+X_train_lasso_scaled = lasso_scaler.transform(X_train[corr_selected])
+
+lasso_cv = LassoCV(cv=5, random_state=RANDOM_STATE).fit(X_train_lasso_scaled, y_reg_train)
+lasso_coef = pd.Series(lasso_cv.coef_, index=corr_selected).sort_values(key=abs)
+
+selected_features = lasso_coef[lasso_coef.abs() > 1e-3].index.tolist()
+dropped_by_lasso = [f for f in corr_selected if f not in selected_features]
+
+print("Dropped by Lasso (near-zero coefficient):", dropped_by_lasso)
+print(f"\nFinal selected feature set ({len(selected_features)} features):")
+selected_features
+```
+
+```{python}
+#| label: lasso-coef-plot
+#| fig-width: 7
+#| fig-height: 5
+fig, ax = plt.subplots(figsize=(7, 5))
+lasso_coef.plot(kind="barh", ax=ax, color="teal")
+ax.set_title(f"LassoCV Coefficients (alpha={lasso_cv.alpha_:.4f})")
+ax.axvline(0, color="black", linewidth=0.8)
+plt.tight_layout()
+plt.show()
+```
+
+We finalize `X_train` / `X_val` / `X_test` down to `selected_features` for all modeling below.
+
+```{python}
+#| label: apply-feature-selection
+X_train = X_train[selected_features]
+X_val = X_val[selected_features]
+X_test = X_test[selected_features]
+```
+
+## 7. Overfitting vs. Underfitting
+
+Before building the full model ladder, we check how model complexity trades off bias and variance using a **validation curve**: as `max_depth` grows, a Decision Tree Regressor should fit the training data better and better (score keeps climbing) while its cross-validated score peaks and then degrades — the gap between the two curves is overfitting.
+
+```{python}
+#| label: validation-curve
+#| fig-width: 7
+#| fig-height: 5
+depths = range(1, 15)
+train_scores, val_scores = validation_curve(
+    DecisionTreeRegressor(random_state=RANDOM_STATE),
+    X_train, y_reg_train,
+    param_name="max_depth", param_range=depths,
+    cv=5, scoring="r2", n_jobs=1,
+)
+
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.plot(depths, train_scores.mean(axis=1), "o-", label="Train R²")
+ax.plot(depths, val_scores.mean(axis=1), "o-", label="Cross-val R²")
+ax.fill_between(depths, train_scores.mean(axis=1) - train_scores.std(axis=1),
+                 train_scores.mean(axis=1) + train_scores.std(axis=1), alpha=0.15)
+ax.fill_between(depths, val_scores.mean(axis=1) - val_scores.std(axis=1),
+                 val_scores.mean(axis=1) + val_scores.std(axis=1), alpha=0.15)
+ax.axvline(6, color="gray", linestyle="--", label="depth=6 (used below)")
+ax.set_xlabel("max_depth")
+ax.set_ylabel("R²")
+ax.set_title("Decision Tree — Validation Curve (Overfitting vs. Underfitting)")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+Below `max_depth≈3` the tree **underfits** (both curves are low — the model is too simple to capture the pattern). Train R² keeps climbing toward 1.0 as depth increases, but cross-val R² plateaus and then drops — past that point the tree **overfits**, memorizing training rows rather than learning generalizable structure. `max_depth=6` (used in the ladder below) sits close to where cross-val performance peaks, before the overfitting gap widens sharply.
+
+## 8. Model Ladder
+
+For each ladder we go **Dummy baseline → simple linear model → Decision Tree → XGBoost with cross-validated tuning**, so every step's improvement (or lack of it) is measured against something simpler. Every non-trivial model is wrapped in an `sklearn.pipeline.Pipeline` so that scaling is **fit on the training fold only** and applied (never refit) to validation/test — this is what makes the pipeline leakage-safe.
+
+### 8.1 Regression ladder — predicting `Life_expectancy`
+
+```{python}
+#| label: reg-ladder
+def eval_regressor(name, model, X_tr, y_tr, X_ev, y_ev):
+    model.fit(X_tr, y_tr)
+    pred = model.predict(X_ev)
+    return {
+        "model": name,
+        "MAE": mean_absolute_error(y_ev, pred),
+        "RMSE": mean_squared_error(y_ev, pred) ** 0.5,
+        "R2": r2_score(y_ev, pred),
+    }, model
+
+reg_results = []
+
+r, dummy_reg = eval_regressor("Dummy (mean)", DummyRegressor(strategy="mean"),
+                               X_train, y_reg_train, X_val, y_reg_val)
+reg_results.append(r)
+
+lin_pipe = Pipeline([("scaler", StandardScaler()), ("model", LinearRegression())])
+r, lin_reg = eval_regressor("Linear Regression", lin_pipe,
+                             X_train, y_reg_train, X_val, y_reg_val)
+reg_results.append(r)
+
+r, tree_reg = eval_regressor("Decision Tree",
+                              DecisionTreeRegressor(max_depth=6, random_state=RANDOM_STATE),
+                              X_train, y_reg_train, X_val, y_reg_val)
+reg_results.append(r)
+
+xgb_reg_pipe = Pipeline([
+    ("scaler", StandardScaler()),
+    ("model", XGBRegressor(random_state=RANDOM_STATE, n_jobs=1)),
+])
+xgb_reg_grid = GridSearchCV(
+    xgb_reg_pipe,
+    param_grid={
+        "model__n_estimators": [200, 400],
+        "model__max_depth": [3, 5],
+        "model__learning_rate": [0.05, 0.1],
+    },
+    cv=5, scoring="neg_root_mean_squared_error", n_jobs=1,
+)
+r, xgb_reg = eval_regressor("XGBoost (tuned)", xgb_reg_grid,
+                             X_train, y_reg_train, X_val, y_reg_val)
+reg_results.append(r)
+print("Best XGBoost params:", xgb_reg_grid.best_params_)
+
+pd.DataFrame(reg_results).set_index("model").round(3)
+```
+
+### 8.2 Classification ladder — predicting `life_expectancy_band`
+
+```{python}
+#| label: clf-ladder
+def eval_classifier(name, model, X_tr, y_tr, X_ev, y_ev, **fit_kwargs):
+    model.fit(X_tr, y_tr, **fit_kwargs)
+    pred = model.predict(X_ev)
+    proba = model.predict_proba(X_ev)
+    return {
+        "model": name,
+        "Accuracy": accuracy_score(y_ev, pred),
+        "F1_weighted": f1_score(y_ev, pred, average="weighted"),
+        "ROC_AUC_ovr": roc_auc_score(y_ev, proba, multi_class="ovr", average="weighted",
+                                      labels=model.classes_ if hasattr(model, "classes_") else None),
+    }, model
+
+clf_results = []
+
+r, dummy_clf = eval_classifier("Dummy (most frequent)",
+                                DummyClassifier(strategy="most_frequent"),
+                                X_train, y_clf_train, X_val, y_clf_val)
+clf_results.append(r)
+
+log_pipe = Pipeline([("scaler", StandardScaler()),
+                      ("model", LogisticRegression(max_iter=1000))])
+r, log_reg = eval_classifier("Logistic Regression", log_pipe,
+                              X_train, y_clf_train, X_val, y_clf_val)
+clf_results.append(r)
+
+r, tree_clf = eval_classifier("Decision Tree",
+                               DecisionTreeClassifier(max_depth=6, random_state=RANDOM_STATE),
+                               X_train, y_clf_train, X_val, y_clf_val)
+clf_results.append(r)
+
+xgb_clf_pipe = Pipeline([
+    ("scaler", StandardScaler()),
+    ("model", XGBClassifier(random_state=RANDOM_STATE, n_jobs=1, eval_metric="mlogloss")),
+])
+xgb_clf_grid = GridSearchCV(
+    xgb_clf_pipe,
+    param_grid={
+        "model__n_estimators": [200, 400],
+        "model__max_depth": [3, 5],
+        "model__learning_rate": [0.05, 0.1],
+    },
+    cv=StratifiedGroupKFold(n_splits=5),
+    scoring="roc_auc_ovr_weighted", n_jobs=1,
+)
+r, xgb_clf = eval_classifier("XGBoost (tuned)", xgb_clf_grid,
+                              X_train, y_clf_train, X_val, y_clf_val,
+                              groups=groups.iloc[train_idx])
+clf_results.append(r)
+print("Best XGBoost params:", xgb_clf_grid.best_params_)
+
+pd.DataFrame(clf_results).set_index("model").round(3)
+```
+
+## 9. Evaluate Honestly (Test Set)
+
+Validation was used to pick the best model in each ladder; final numbers are reported on the **held-out test set**, touched only once, here.
+
+```{python}
+#| label: test-leaderboard-reg
+reg_test_results = []
+for name, model in [("Dummy (mean)", dummy_reg), ("Linear Regression", lin_reg),
+                     ("Decision Tree", tree_reg), ("XGBoost (tuned)", xgb_reg)]:
+    pred = model.predict(X_test)
+    reg_test_results.append({
+        "model": name,
+        "MAE": mean_absolute_error(y_reg_test, pred),
+        "RMSE": mean_squared_error(y_reg_test, pred) ** 0.5,
+        "R2": r2_score(y_reg_test, pred),
+    })
+reg_leaderboard = pd.DataFrame(reg_test_results).set_index("model").round(3)
+reg_leaderboard
+```
+
+```{python}
+#| label: test-leaderboard-clf
+clf_test_results = []
+for name, model in [("Dummy (most frequent)", dummy_clf), ("Logistic Regression", log_reg),
+                     ("Decision Tree", tree_clf), ("XGBoost (tuned)", xgb_clf)]:
+    pred = model.predict(X_test)
+    proba = model.predict_proba(X_test)
+    clf_test_results.append({
+        "model": name,
+        "Accuracy": accuracy_score(y_clf_test, pred),
+        "F1_weighted": f1_score(y_clf_test, pred, average="weighted"),
+        "ROC_AUC_ovr": roc_auc_score(y_clf_test, proba, multi_class="ovr", average="weighted",
+                                      labels=model.classes_ if hasattr(model, "classes_") else None),
+    })
+clf_leaderboard = pd.DataFrame(clf_test_results).set_index("model").round(3)
+clf_leaderboard
+```
+
+Both ladders beat their Dummy baseline by a wide margin on the test set, and the gap between validation and test scores for each model is small — a sign the country-grouped, stratified split is doing its job and we are not quietly overfitting to validation.
+
+```{python}
+#| label: confusion-matrix
+#| fig-width: 5
+#| fig-height: 4
+best_clf_pred = xgb_clf.predict(X_test)
+cm = confusion_matrix(y_clf_test, best_clf_pred, labels=[0, 1, 2])
+disp = ConfusionMatrixDisplay(cm, display_labels=BAND_LABELS)
+disp.plot(cmap="Blues", values_format="d")
+plt.title("XGBoost — Confusion Matrix (Test Set)")
+plt.show()
+```
+
+```{python}
+#| label: pred-vs-actual
+#| fig-width: 6
+#| fig-height: 5
+best_reg_pred = xgb_reg.predict(X_test)
+plt.figure(figsize=(6, 5))
+plt.scatter(y_reg_test, best_reg_pred, alpha=0.4, s=18)
+lims = [y_reg_test.min() - 2, y_reg_test.max() + 2]
+plt.plot(lims, lims, "r--", label="Perfect prediction")
+plt.xlabel("Actual Life Expectancy")
+plt.ylabel("Predicted Life Expectancy")
+plt.title("XGBoost — Predicted vs Actual (Test Set)")
+plt.legend()
+plt.tight_layout()
+plt.show()
+```
+
+## 10. Interpret
+
+```{python}
+#| label: feature-importance
+#| fig-width: 8
+#| fig-height: 6
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+reg_importance = pd.Series(
+    xgb_reg.best_estimator_.named_steps["model"].feature_importances_,
+    index=selected_features
+).sort_values()
+reg_importance.tail(10).plot(kind="barh", ax=axes[0], color="steelblue")
+axes[0].set_title("XGBoost Regressor — Top Features\n(predicting Life Expectancy)")
+
+clf_importance = pd.Series(
+    xgb_clf.best_estimator_.named_steps["model"].feature_importances_,
+    index=selected_features
+).sort_values()
+clf_importance.tail(10).plot(kind="barh", ax=axes[1], color="darkorange")
+axes[1].set_title("XGBoost Classifier — Top Features\n(predicting Life Expectancy Band)")
+
+plt.tight_layout()
+plt.show()
+```
+
+### Real-world meaning
+
+- **HIV/AIDS prevalence** and **Adult Mortality** dominate the regression model — both are near-direct components of a life-expectancy calculation, so this is expected rather than a novel finding.
+- **Income composition of resources** and **Schooling** carry most of the remaining signal, consistent with the well-established development-economics link between education, income equality, and health outcomes.
+- The classification ladder (Low/Medium/High life-expectancy band) leans on a very similar set of top features. This is reassuring rather than circular: unlike the original `Status` label, `life_expectancy_band` is derived only from `Life_expectancy` itself, so seeing the *same* health/economic drivers surface independently for both tasks is genuine corroborating evidence, not an artifact of a shared, income-based label.
+- Practically: a country with high adult mortality, high HIV/AIDS prevalence, low schooling and low income composition of resources is reliably flagged into the "Low" life-expectancy band — these are the levers a health-policy team should prioritize.
+
+### Limitations
+
+- **Imputation bias**: missing values were filled with country-level (then global) medians, which understates true variance for countries with sparse reporting — a real limitation for small/low-income nations, which are disproportionately affected by missing data in this dataset to begin with. Note this imputation happens *before* the train/test split (Section 3), a simplification — a stricter pipeline would fit imputation medians on the training fold only.
+- **Correlation vs. causation**: none of these features were derived from a causal design; feature importance reflects predictive association only, not policy-actionable causal effects (e.g. "more schooling causes longer life" is not established here).
+- **Generalization**: the country-grouped split tests generalization to *unseen countries*, which is the harder, more honest test — but it also means test performance will look worse than a leaky random split, and results should not be read as "this model works for any new country" without caveats about data coverage (this dataset skews toward WHO-reporting countries and 2000–2015 only).
+- **Band boundaries are somewhat arbitrary**: tertile cut points shift the classification task's difficulty — a country near a band boundary can flip class with small changes in its inputs, so class predictions near boundaries should be treated as low-confidence even when the model's probability output looks decisive.
+- **Small-N tail risk**: a handful of very high-population or high-GDP countries were winsorized rather than removed; this reduces their leverage on linear models but the underlying data quality issues for those extreme values (self-reported by national governments) are not resolved by capping.

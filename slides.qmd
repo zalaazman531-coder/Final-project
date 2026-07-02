@@ -1,0 +1,100 @@
+---
+title: "Life Expectancy Predictor — WHO Data 2000–2015"
+author: "Final Project"
+format:
+  revealjs:
+    theme: simple
+    slide-number: true
+    embed-resources: true
+    transition: slide
+---
+
+## The Problem
+
+Life expectancy differs by **more than 40 years** between countries.
+
+- It is the single clearest summary of a nation's health — and of whether
+  health policy is working.
+- Governments and health organizations need to know **which levers actually
+  move it**: vaccines? spending? education?
+
+**What we're predicting:** given a country's health and economic indicators,
+
+1. its **life expectancy in years**, and
+2. whether it falls in the **Low, Medium, or High** group.
+
+## Dataset & Approach {.smaller}
+
+**The data:** World Health Organization records — **193 countries**, every year
+from **2000 to 2015** (~2,900 country-years), covering immunization rates,
+disease prevalence, schooling, income, and health spending.
+
+**Two prediction tasks:**
+
+- *"How long?"* — predict life expectancy in years
+- *"Which group?"* — predict the Low / Medium / High band
+
+**The honest test:** models were evaluated only on countries they had
+**never seen during training** — no memorizing a country and getting quizzed
+on its neighboring year.
+
+## Key Findings — Regression
+
+**How close can we get to a country's true life expectancy?**
+
+| | Average error |
+|---|---|
+| Naive guess (global average) | **~7.3 years** |
+| Our best model (XGBoost) | **~2.2 years** |
+
+The model is more than **3× more accurate than guessing** — for countries
+it has never seen.
+
+## Key Findings — Classification
+
+**Can we sort unseen countries into Low / Medium / High life expectancy?**
+
+| | Correct |
+|---|---|
+| Naive guess (always pick the biggest group) | **34%** |
+| Our best model (XGBoost) | **77%** |
+
+The model also ranks countries by risk extremely well (ROC-AUC 0.92,
+where 1.0 is perfect and 0.5 is coin-flipping). Most mistakes are
+"one band off" — Low is almost never confused with High.
+
+## What Drives Life Expectancy {.smaller}
+
+::: {.incremental}
+1. **HIV/AIDS prevalence & adult mortality** — the strongest predictors.
+   Partly by definition: where adults die young, life expectancy is low.
+2. **Schooling & income composition** — the most interesting finding.
+   Beyond direct mortality, how educated and economically developed a
+   population is tells most of the rest of the story.
+3. **Immunization coverage & health spending** — matter, but less than
+   the above.
+:::
+
+. . .
+
+> Education and income predict life expectancy better than most direct
+> health-spending measures in this data.
+
+## Limitations & Recommendations {.smaller}
+
+**Limitations — what this model cannot do:**
+
+- **Patterns, not causes** — it doesn't prove schooling *causes* longer lives.
+- **Countries, not people** — national averages say nothing about individuals.
+- **2000–2015, self-reported** — data is weakest exactly where health systems are.
+
+**Recommendations:**
+
+- Use it as a **screening tool**: flag countries whose indicators don't match
+  their reported life expectancy, and investigate.
+- Treat **education and income as health policy**, not side issues.
+
+. . .
+
+*Everything is reproducible — full report, live prediction app, and code in
+the project repository.*

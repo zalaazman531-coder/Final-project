@@ -1,0 +1,5 @@
+model,MAE,RMSE,R2
+Dummy (mean),7.325,8.713,-0.004
+Linear Regression,3.165,4.293,0.756
+Decision Tree,2.489,3.477,0.84
+XGBoost (tuned),2.19,3.017,0.88
